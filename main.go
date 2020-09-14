@@ -451,7 +451,7 @@ func main() {
 	}
 
 	adminRouter.Handle("/health", Healthz(&healthy))
-	adminRouter.Handle("/metrics", promhttp.Handler())
+	adminRouter.Handle("/monitor/l7check", Healthz(&healthy))
 	adminRouter.Handle("/quitquitquit", QuitQuitQuit(&healthy, shutdownFunc))
 	adminRouter.Handle("/abortabortabort", AbortAbortAbort(&healthy, shutdownFunc))
 	adminRouter.HandleFunc("/debug/pprof/", pprof.Index)

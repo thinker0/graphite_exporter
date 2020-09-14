@@ -1,0 +1,12 @@
+FROM centos:7
+
+RUN yum -y update --exclude 'kernel*' && \
+    yum -y groupinstall 'Development Tools' && \
+    yum -y install wget cyrus-sasl-devel tree vim
+
+RUN rpm --import https://mirror.go-repo.io/centos/RPM-GPG-KEY-GO-REPO && \
+    curl -s https://mirror.go-repo.io/centos/go-repo.repo | tee /etc/yum.repos.d/go-repo.repo && \
+    yum -y install golang
+
+RUN mkdir -p /go/src /root/.ssh
+RUN rm -rf /go/pkg

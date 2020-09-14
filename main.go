@@ -16,17 +16,20 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"math"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	_ "net/http/pprof"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -37,6 +40,7 @@ import (
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/statsd_exporter/pkg/mapper"
+	"github.com/urfave/negroni"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
@@ -50,6 +54,7 @@ var (
 	cacheSize       = kingpin.Flag("graphite.cache-size", "Maximum size of your metric mapping cache. Relies on least recently used replacement policy if max size is reached.").Default("1000").Int()
 	cacheType       = kingpin.Flag("graphite.cache-type", "Metric mapping cache type. Valid options are \"lru\" and \"random\"").Default("lru").Enum("lru", "random")
 	dumpFSMPath     = kingpin.Flag("debug.dump-fsm", "The path to dump internal FSM generated for glob matching as Dot file.").Default("").String()
+	listenAdmin     = kingpin.Flag("admin.port", "admin listen address").Default(":9000").String()
 
 	lastProcessed = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -69,6 +74,8 @@ var (
 			Help: "Total count of samples with invalid tags",
 		})
 	invalidMetricChars = regexp.MustCompile("[^a-zA-Z0-9_:]")
+
+	healthy int32
 )
 
 type graphiteSample struct {
@@ -290,6 +297,43 @@ func dumpFSM(mapper *mapper.MetricMapper, dumpFilename string, logger log.Logger
 	return nil
 }
 
+func Healthz(healthy *int32) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.LoadInt32(healthy) == 1 {
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintln(w, "ok")
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+}
+
+func QuitQuitQuit(healthy *int32, shutdown func()) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		atomic.StoreInt32(healthy, 0)
+		defer shutdown()
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintln(w, "ok")
+	})
+}
+
+func AbortAbortAbort(healthy *int32, shutdown func()) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		defer shutdown()
+		atomic.StoreInt32(healthy, 0)
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintln(w, "ok")
+	})
+}
+
 func main() {
 	promlogConfig := &promlog.Config{}
 	flag.AddFlags(kingpin.CommandLine, promlogConfig)
@@ -386,6 +430,41 @@ func main() {
       </body>
       </html>`))
 	})
+
+	adminRouter := http.NewServeMux()
+	adminN := negroni.Classic()
+	adminN.UseHandler(adminRouter)
+	adminServer := &http.Server{
+		Addr:         *listenAdmin,
+		Handler:      adminN,
+		ReadTimeout:  120 * time.Second,
+		WriteTimeout: 120 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+	shutdownFunc := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		adminServer.SetKeepAlivesEnabled(false)
+		if err := adminServer.Shutdown(ctx); err != nil {
+			level.Error(logger).Log("Could not gracefully shutdown the httpServer: %v", err)
+		}
+	}
+
+	adminRouter.Handle("/health", Healthz(&healthy))
+	adminRouter.Handle("/metrics", promhttp.Handler())
+	adminRouter.Handle("/quitquitquit", QuitQuitQuit(&healthy, shutdownFunc))
+	adminRouter.Handle("/abortabortabort", AbortAbortAbort(&healthy, shutdownFunc))
+	adminRouter.HandleFunc("/debug/pprof/", pprof.Index)
+	adminRouter.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	adminRouter.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	adminRouter.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	adminRouter.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	go func() {
+		level.Info(logger).Log("AdminServer is ready to handle requests at", listenAdmin)
+		if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			level.Info(logger).Log("Could not listen on %s: %v", listenAdmin, err)
+		}
+	}()
 
 	level.Info(logger).Log("msg", "Listening on "+*listenAddress)
 	level.Error(logger).Log("err", http.ListenAndServe(*listenAddress, nil))
